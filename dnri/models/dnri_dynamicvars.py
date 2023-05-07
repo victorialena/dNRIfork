@@ -7,6 +7,8 @@ import dnri.models.model_utils as model_utils
 from .model_utils import RefNRIMLP, encode_onehot, get_graph_info
 import math
 
+import pdb
+
 
 class DNRI_DynamicVars(nn.Module):
     def __init__(self, params):
@@ -350,6 +352,7 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight.data)
                 m.bias.data.fill_(0.1)
+
     def node2edge(self, node_embeddings, send_edges, recv_edges):
         #node_embeddings: [batch, num_nodes, embed_size]
         send_embed = node_embeddings[:, send_edges, :]
@@ -404,9 +407,10 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             #TODO: is it faster to put this on cpu or gpu?
             edge_info = [torch.where(torch.ones(nvar, device=num_vars.device) - torch.eye(nvar, device=num_vars.device)) for nvar in num_vars]
             offsets = torch.cat([torch.tensor([0], dtype=torch.long, device=num_vars.device), num_vars.cumsum(0)[:-1]])
-            send_edges = torch.cat([l[0] + offset for l,offset in zip(edge_info, offsets)])
+            send_edges = torch.cat([l[0] + offset for l, offset in zip(edge_info, offsets)])
             recv_edges = torch.cat([l[1] + offset for l, offset in zip(edge_info, offsets)])
             
+            pdb.set_trace()
             flat_inp = inputs[flat_masks]
             tmp_batch = flat_inp.size(0)
             x = self.mlp1(flat_inp)
@@ -431,6 +435,7 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         return final_result
 
     def forward(self, inputs, node_masks, all_node_inds, all_graph_info, normalized_inputs=None):
+        pdb.set_trace()
         if inputs.size(0) > 1:
             raise ValueError("Batching during forward not currently supported")
         if self.normalize_mode == 'normalize_all':
@@ -441,6 +446,8 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         else:
             # Right now, we'll always want to do this
             raise NotImplementedError
+        
+        pdb.set_trace()
         # Inputs is shape [batch, num_timesteps, num_vars, input_size]
         num_timesteps = node_masks.size(1)
         max_num_vars = inputs.size(2)

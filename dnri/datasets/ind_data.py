@@ -5,6 +5,9 @@ from torch.utils.data import Dataset
 from dnri.utils import data_utils
 import os, argparse
 
+DATA_PATH='data/ind_processed/'
+import pdb
+
 
 class IndData(Dataset):
     def __init__(self, data_path, mode, params):
@@ -145,7 +148,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser('Build ind datasets')
     parser.add_argument('--data_dir', required=True)
-    parser.add_argument('--output_dir', required=True)
+    parser.add_argument('--output_dir', type=str, default=DATA_PATH)
     parser.add_argument('--num_train', type=int, default=19)
     parser.add_argument('--num_val', type=int, default=7)
     parser.add_argument('--downsample_factor', type=int, default=10)
@@ -156,12 +159,10 @@ if __name__ == '__main__':
     all_masks = []
     min_feats = np.array([100000000000000, 100000000000000, 100000000000000, 10000000000000])
     max_feats = np.array([-100000000000000, -100000000000000, -100000000000000, -10000000000000])
-    for track_set_id,track_set in enumerate(all_tracks):
+    for track_set_id, track_set in enumerate(all_tracks):
         num_tracks = len(track_set)
-        max_frame = 0
-        for track_info in all_static[track_set_id]:
-            max_frame = max(max_frame, track_info['finalFrame'])
-        print("%d: %d", track_set_id, max_frame)
+        max_frame = max([tr['frame'].max() for tr in track_set])
+        
         feats = np.zeros((max_frame+1, num_tracks, 4))
         masks = np.zeros((max_frame+1, num_tracks))
         for track_id, track in enumerate(track_set):

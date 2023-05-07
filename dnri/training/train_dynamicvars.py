@@ -9,6 +9,10 @@ import time, os
 
 import random
 import numpy as np
+import pdb
+
+DATA_PATH='data/ind_processed/'
+from dnri.utils.data_utils import unnormalize, ade, fde, mse, print_logs
 
 def train(model, train_data, val_data, params, train_writer, val_writer):
     gpu = params.get('gpu', False)
@@ -36,8 +40,9 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     normalize_inputs = params['normalize_inputs']
     num_decoder_samples = 1
     train_data_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
-    print("NUM BATCHES: ",len(train_data_loader))
     val_data_loader = DataLoader(val_data, batch_size=val_batch_size, collate_fn=collate_fn)
+
+    print("NUM BATCHES: ",len(train_data_loader))
     lr = params['lr']
     wd = params.get('wd', 0.)
     mom = params.get('mom', 0.)
@@ -47,6 +52,10 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         opt = torch.optim.Adam(model_params, lr=lr, weight_decay=wd)
     else:
         opt = torch.optim.SGD(model_params, lr=lr, weight_decay=wd, momentum=mom)
+
+    # ---------------HERE
+    min_feats, max_feats = torch.load(os.path.join(DATA_PATH, 'train_data_stats'))
+    # ---------------HERE
 
     working_dir = params['working_dir']
     best_path = os.path.join(working_dir, 'best_model')
@@ -72,7 +81,13 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     misc.seed(1)
     for epoch in range(start_epoch, num_epochs+1):
         model.epoch = epoch
-        print("EPOCH", epoch, (end-start))
+        print("EPOCH", epoch, (end-start), "[s]")
+
+        nll_train = []
+        kl_train = []
+        mse_train = []
+        fde_train = []
+        ade_train = []
 
         model.train_percent = epoch / num_epochs
         start = time.time() 
@@ -101,11 +116,32 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                         sub_masks = masks[sub_batch_ind:sub_batch_ind+sub_batch_size]
                         sub_node_inds = node_inds[sub_batch_ind:sub_batch_ind+sub_batch_size]
                         sub_graph_info = graph_info[sub_batch_ind:sub_batch_ind+sub_batch_size]
-                        loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, sub_masks, sub_node_inds, sub_graph_info, **args)
+                        loss, loss_nll, loss_kl, logits, preds = model.calculate_loss(sub_inputs, 
+                                                                                      sub_masks,
+                                                                                      sub_node_inds,
+                                                                                      sub_graph_info,
+                                                                                      **args)
+
                     else:
                         loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, **args)
                     loss = loss / (sub_steps*accumulate_steps*num_decoder_samples)
                     loss.backward()
+
+                    # ---------------------------- START
+                    _output, _target = preds[..., :2], sub_inputs[:, 1:, :, :2]
+                    _masks = ((sub_masks[:, :-1] == 1)*(sub_masks[:, 1:] == 1)).float()
+
+                    _output[..., 0] = unnormalize(_output[..., 0], max_feats[0], min_feats[0])
+                    _output[..., 1] = unnormalize(_output[..., 1], max_feats[1], min_feats[1])
+                    _target[..., 0] = unnormalize(_target[..., 0], max_feats[0], min_feats[0])
+                    _target[..., 1] = unnormalize(_target[..., 1], max_feats[1], min_feats[1])
+
+                    mse_train.append(mse(_output, _target, _masks).item())
+                    nll_train.append(loss_nll.data.item())
+                    kl_train.append(loss_kl.data.item())
+                    ade_train.append(ade(_output, _target, _masks).item())
+                    fde_train.append(fde(_output, _target, _masks).item())
+                    # ---------------------------- START
                 
                 if verbose:
                     tmp_batch_ind = batch_ind*sub_steps + sub_batch_ind + 1
@@ -123,7 +159,9 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 opt.zero_grad()
                 if accumulate_steps > 0 and accumulate_steps > len(train_data_loader) - batch_ind - 1:
                     break
-            
+        
+        print_logs('train', nll_train, kl_train, mse_train, ade_train, fde_train)
+
         if training_scheduler is not None:
             training_scheduler.step()
         
