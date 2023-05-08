@@ -81,7 +81,9 @@ class DNRI_DynamicVars(nn.Module):
 
             encoder_inp = current_burn_in_masks*current_inps + (1-current_burn_in_masks)*predictions
             
-            current_edge_logits, prior_hidden, current_edge_attr = self.encoder.single_step_forward(encoder_inp, current_masks, current_node_inds, current_graph_info, prior_hidden)
+            current_edge_logits, prior_hidden, *other = self.encoder.single_step_forward(encoder_inp, current_masks, current_node_inds, current_graph_info, prior_hidden)
+            
+            current_edge_attr = other[0] if other else None
             predictions, decoder_hidden, _ = self.single_step_forward(encoder_inp, current_masks,
                                                                       current_graph_info, decoder_hidden,
                                                                       current_edge_logits, hard_sample=True,
@@ -98,7 +100,9 @@ class DNRI_DynamicVars(nn.Module):
         all_predictions = []
         all_priors = []
         hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, posterior_logits, _, edge_attr = self.encoder(inputs[:, :-1], node_masks[:, :-1], node_inds, graph_info, normalized_inputs)
+        prior_logits, posterior_logits, _, *other = self.encoder(inputs[:, :-1], node_masks[:, :-1], node_inds, graph_info, normalized_inputs)
+        
+        edge_attr = other[0] if other else None
         
         teacher_forcing_steps = self.teacher_forcing_steps
         edge_ind = 0
@@ -113,13 +117,20 @@ class DNRI_DynamicVars(nn.Module):
             node_inds = current_node_masks.nonzero()[:, -1]
             num_edges = len(node_inds)*(len(node_inds)-1)
             current_graph_info = graph_info[0][step]
-            current_edge_attr = edge_attr[:, edge_ind:edge_ind+num_edges]
+            
+            if edge_attr is not None:
+                current_edge_attr = edge_attr[:, edge_ind:edge_ind+num_edges]
+            else:
+                current_edge_attr = None
+
             if not use_prior_logits:
                 current_p_logits = posterior_logits[:, edge_ind:edge_ind+num_edges]
             else:
                 current_p_logits = prior_logits[:, edge_ind:edge_ind+num_edges]
+            
             if self.gpu:
                 current_p_logits = current_p_logits.cuda(non_blocking=True)
+            
             edge_ind += num_edges
             predictions, decoder_hidden, edges = self.single_step_forward(current_inputs,
                                                                           current_node_masks,
@@ -211,6 +222,8 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         no_bn = params['no_encoder_bn']
         dropout = params['encoder_dropout']
 
+        self.eval_edge_features = params['edge_features']
+
         hidden_size = params['encoder_hidden']
         self.rnn_hidden_size = rnn_hidden_size = params['encoder_rnn_hidden']
         rnn_type = params['encoder_rnn_type']
@@ -259,7 +272,7 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             self.bn = nn.BatchNorm1d(inp_size)
         # Possible options: None, 'normalize_inp', 'normalize_all'
 
-        if True: #params.edge_features:
+        if self.eval_edge_features:
             tmp_hidden_size = params['prior_hidden_size']
             layers = [nn.Linear(rnn_hidden_size, tmp_hidden_size), nn.ELU(inplace=True)]
             for _ in range(num_layers - 2):
@@ -448,9 +461,11 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         all_states = torch.cat([all_forward_states, all_reverse_states], dim=-1)
         
         prior_result = self.prior_fc_out(all_forward_states)
-        edge_features = self.features_fc_out(all_forward_states)
         encoder_result = self.encoder_fc_out(all_states)
-        return prior_result, encoder_result, forward_state, edge_features
+        if self.eval_edge_features:
+            edge_features = self.features_fc_out(all_forward_states)
+            return prior_result, encoder_result, forward_state, edge_features
+        return prior_result, encoder_result, forward_state
         
     def single_step_forward(self, inputs, node_masks, node_inds, all_graph_info, forward_state):
         if self.normalize_mode == 'normalize_all':
@@ -475,11 +490,13 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             tmp_state1[:, global_edge_inds] = current_state[1]
             forward_state = (tmp_state0, tmp_state1)
             prior_result = self.prior_fc_out(current_state[0])
-            edge_features = self.features_fc_out(current_state[0])
+            if self.eval_edge_features:
+                edge_features = self.features_fc_out(current_state[0])
+                return prior_result, forward_state, edge_features
         else:
             prior_result = torch.empty(1, 0, self.num_edges)
 
-        return prior_result, forward_state, edge_features
+        return prior_result, forward_state
 
 
 class DNRI_DynamicVars_Decoder(nn.Module):
@@ -492,7 +509,7 @@ class DNRI_DynamicVars_Decoder(nn.Module):
         skip_first = params['skip_first']
         out_size = params['input_size']
         do_prob = params['decoder_dropout']
-        edge_feature_dim = EDGE_FEAT_DIM
+        edge_feature_dim = EDGE_FEAT_DIM if params['edge_features'] else 0
 
         self.msg_fc1 = nn.ModuleList(
             [nn.Linear(2*n_hid + edge_feature_dim, n_hid) for _ in range(edge_types)]

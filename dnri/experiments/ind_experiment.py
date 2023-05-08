@@ -43,6 +43,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     params = vars(args)
+    # pdb.set_trace()
 
     # ----------- save files
     if args.mode == 'train':
@@ -67,7 +68,6 @@ if __name__ == '__main__':
     model = model_builder.build_model(params)
     
     if args.mode == 'train':
-        pdb.set_trace()
         train_data = IndData(args.data_path, 'train', params)
         val_data = IndData(args.data_path, 'valid', params)
         train.train(model, train_data, val_data, params, log)

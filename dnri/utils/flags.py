@@ -74,5 +74,7 @@ def build_flags():
     parser.add_argument('--encoder_save_eval_memory', action='store_true')
     parser.add_argument('--encoder_normalize_mode', choices=[None, 'normalize_inp', 'normalize_all'])
     parser.add_argument('--normalize_inputs', action='store_true')
+    parser.add_argument('--edge_features', action='store_true', default=False)
+    
     #Modes
     return parser
