@@ -14,7 +14,7 @@ import pdb
 DATA_PATH='data/ind_processed/'
 from dnri.utils.data_utils import unnormalize, ade, fde, mse, print_logs
 
-def train(model, train_data, val_data, params, train_writer, val_writer):
+def train(model, train_data, val_data, params, log):
     gpu = params.get('gpu', False)
     batch_size = params.get('batch_size', 1000)
     sub_batch_size = params.get('sub_batch_size')
@@ -58,23 +58,10 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     # ---------------HERE
 
     working_dir = params['working_dir']
-    best_path = os.path.join(working_dir, 'best_model')
-    checkpoint_dir = os.path.join(working_dir, 'model_checkpoint')
-    training_path = os.path.join(working_dir, 'training_checkpoint')
-    if continue_training:
-        print("RESUMING TRAINING")
-        model.load(checkpoint_dir)
-        train_params = torch.load(training_path)
-        start_epoch = train_params['epoch']
-        opt.load_state_dict(train_params['optimizer'])
-        best_val_result = train_params['best_val_result']
-        best_val_epoch = train_params['best_val_epoch']
-        model.steps = train_params['step']
-        print("STARTING EPOCH: ",start_epoch)
-    else:
-        start_epoch = 1
-        best_val_epoch = -1
-        best_val_result = 10000000
+
+    start_epoch = 1
+    best_val_epoch = -1
+    best_val_result = 10000000
     
     training_scheduler = train_utils.build_scheduler(opt, params)
     end = start = 0 
@@ -101,6 +88,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 inputs = inputs.cuda(non_blocking=True)
                 if masks is not None:
                     masks = masks.cuda(non_blocking=True)
+
             args = {'is_train':True, 'return_logits':True}
             sub_steps = len(range(0, batch_size, sub_batch_size))
             for sub_batch_ind in range(0, batch_size, sub_batch_size):
@@ -116,6 +104,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                         sub_masks = masks[sub_batch_ind:sub_batch_ind+sub_batch_size]
                         sub_node_inds = node_inds[sub_batch_ind:sub_batch_ind+sub_batch_size]
                         sub_graph_info = graph_info[sub_batch_ind:sub_batch_ind+sub_batch_size]
+                        
                         loss, loss_nll, loss_kl, logits, preds = model.calculate_loss(sub_inputs, 
                                                                                       sub_masks,
                                                                                       sub_node_inds,
@@ -143,10 +132,6 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                     fde_train.append(fde(_output, _target, _masks).item())
                     # ---------------------------- START
                 
-                if verbose:
-                    tmp_batch_ind = batch_ind*sub_steps + sub_batch_ind + 1
-                    tmp_total_batch = len(train_data_loader)*sub_steps
-                    print("\tBATCH %d OF %d: %f, %f, %f"%(tmp_batch_ind, tmp_total_batch, loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
             if accumulate_steps == -1 or (batch_ind+1)%accumulate_steps == 0:
                 if verbose and accumulate_steps > 0:
                     print("\tUPDATING WEIGHTS")
@@ -161,27 +146,27 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                     break
         
         print_logs('train', nll_train, kl_train, mse_train, ade_train, fde_train)
+        print_logs('train', nll_train, kl_train, mse_train, ade_train, fde_train, outfile=log)
+        log.flush()
 
         if training_scheduler is not None:
             training_scheduler.step()
-        
-        if train_writer is not None:
-            train_writer.add_scalar('loss', loss.item()*(sub_steps*accumulate_steps*num_decoder_samples), global_step=epoch)
-            if normalize_nll:
-                train_writer.add_scalar('NLL', loss_nll.mean().item(), global_step=epoch)
-            else:
-                train_writer.add_scalar('NLL', loss_nll.mean().item()/(inputs.size(1)*inputs.size(2)), global_step=epoch)
-            
-            train_writer.add_scalar("KL Divergence", loss_kl.mean().item(), global_step=epoch)
+                
         if ((epoch+1)%val_interval != 0):
             end = time.time()
             continue
+
         model.eval()
         opt.zero_grad()
         total_nll = 0
         total_kl = 0
-        if verbose:
-            print("COMPUTING VAL LOSSES")
+
+        nll_valid = []
+        kl_valid = []
+        mse_valid = []
+        fde_valid = []
+        ade_valid = []
+
         with torch.no_grad():
             for batch_ind, batch in enumerate(val_data_loader):
                 inputs = batch['inputs']
@@ -193,44 +178,46 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                     if masks is not None:
                         masks = masks.cuda(non_blocking=True)
                 if masks is not None:
-                    loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, masks, node_inds, graph_info, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
+                    loss, loss_nll, loss_kl, logits, preds = model.calculate_loss(inputs, masks, node_inds, graph_info, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
                 else:
                     loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
                 total_kl += loss_kl.sum().item()
                 total_nll += loss_nll.sum().item()
-            if verbose:
-                print("\tVAL BATCH %d of %d: %f, %f"%(batch_ind+1, len(val_data_loader), loss_nll.mean(), loss_kl.mean()))
+
+
+                # ---------------------------- START
+                _output, _target = preds[..., :2], inputs[:, 1:, :, :2]
+                _masks = ((masks[:, :-1] == 1)*(masks[:, 1:] == 1)).float()
+
+                _output[..., 0] = unnormalize(_output[..., 0], max_feats[0], min_feats[0])
+                _output[..., 1] = unnormalize(_output[..., 1], max_feats[1], min_feats[1])
+                _target[..., 0] = unnormalize(_target[..., 0], max_feats[0], min_feats[0])
+                _target[..., 1] = unnormalize(_target[..., 1], max_feats[1], min_feats[1])
+
+                mse_valid.append(mse(_output, _target, _masks).item())
+                nll_valid.append(loss_nll.data.item())
+                kl_valid.append(loss_kl.data.item())
+                ade_valid.append(ade(_output, _target, _masks).item())
+                fde_valid.append(fde(_output, _target, _masks).item())
+                # ---------------------------- START
+            
+            print_logs('valid', nll_valid, kl_valid, mse_valid, ade_valid, fde_valid)
+            print_logs('valid', nll_valid, kl_valid, mse_valid, ade_valid, fde_valid, outfile=log)
+            log.flush()
             
         total_kl /= len(val_data)
         total_nll /= len(val_data)
-        total_loss = model.kl_coef*total_kl + total_nll #TODO: this is a thing you fixed
-        #total_loss = total_kl + total_nll
-        if val_writer is not None:
-            val_writer.add_scalar('loss', total_loss, global_step=epoch)
-            val_writer.add_scalar("NLL", total_nll, global_step=epoch)
-            val_writer.add_scalar("KL Divergence", total_kl, global_step=epoch)
-        
-        if tune_on_nll:
-            tuning_loss = total_nll
-        else:
-            tuning_loss = total_loss
+        total_loss = model.kl_coef*total_kl + total_nll
+
+        tuning_loss = total_nll if tune_on_nll else total_loss
         if tuning_loss < best_val_result:
             best_val_epoch = epoch
             best_val_result = tuning_loss
             print("BEST VAL RESULT. SAVING MODEL...")
-            model.save(best_path)
-        model.save(checkpoint_dir)
-        torch.save({
-                    'epoch':epoch+1,
-                    'optimizer':opt.state_dict(),
-                    'best_val_result':best_val_result,
-                    'best_val_epoch':best_val_epoch,
-                    'step':model.steps,
-                   }, training_path)
-        print("EPOCH %d EVAL: "%epoch)
-        print("\tCURRENT VAL LOSS: %f"%tuning_loss)
-        print("\tBEST VAL LOSS:    %f"%best_val_result)
-        print("\tBEST VAL EPOCH:   %d"%best_val_epoch)
+            print("BEST VAL RESULT. SAVING MODEL...", file=log)
+            log.flush()
+            model.save(working_dir)
+        
         
         end = time.time()
 

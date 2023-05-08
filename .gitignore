@@ -1,4 +1,4 @@
-logs/*
+# logs/*
 **/*.npy
 
 # Byte-compiled / optimized / DLL files

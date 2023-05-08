@@ -11,7 +11,7 @@ import pdb
 
 class IndData(Dataset):
     def __init__(self, data_path, mode, params):
-        self.mode = mode
+        self.mode = 'train' #mode
         if mode == 'train':
             path = os.path.join(data_path, 'processed_train_data')
         elif mode == 'valid':
@@ -27,12 +27,12 @@ class IndData(Dataset):
         max_burn_in_count = params['max_burn_in_count']
         if max_burn_in_count == -1:
             max_burn_in_count = 1000000000000000000
-        test_short_sequences = params['test_short_sequences']
-        if mode == 'test' and test_short_sequences:
-            new_feats = sum([list(feat.split(50)) for feat in self.feats], [])
-            new_masks = sum([list(mask.split(50)) for mask in self.masks], [])
-            self.feats = new_feats
-            self.masks = new_masks
+        # test_short_sequences = params['test_short_sequences']
+        # if mode == 'test' and test_short_sequences:
+        #     new_feats = sum([list(feat.split(50)) for feat in self.feats], [])
+        #     new_masks = sum([list(mask.split(50)) for mask in self.masks], [])
+        #     self.feats = new_feats
+        #     self.masks = new_masks
         graph_cache = {}
         print("Building graph info...")
         for mask in self.masks:
@@ -54,7 +54,8 @@ class IndData(Dataset):
                 current_graph_info.append(graph_info)
             self.burn_in_masks.append(burn_in_mask)
         self.expand_train = params.get('expand_train', False)
-        if self.mode == 'train' and self.expand_train and self.train_data_len > 0:
+        # if self.mode == 'train' and 
+        if self.expand_train and self.train_data_len > 0:
             self.all_inds = []
             for ind in range(len(self.feats)):
                 t_ind = 0

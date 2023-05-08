@@ -8,6 +8,9 @@ from .model_utils import RefNRIMLP, encode_onehot, get_graph_info
 import math
 
 import pdb
+import os
+
+EDGE_FEAT_DIM=64
 
 
 class DNRI_DynamicVars(nn.Module):
@@ -21,7 +24,7 @@ class DNRI_DynamicVars(nn.Module):
         # Training params
         self.gumbel_temp = params.get('gumbel_temp')
         self.train_hard_sample = params.get('train_hard_sample')
-        self.teacher_forcing_steps = params.get('teacher_forcing_steps', -1)
+        self.teacher_forcing_steps = 50 # params.get('teacher_forcing_steps', -1)
 
         self.normalize_kl = params.get('normalize_kl', False)
         self.normalize_kl_per_var = params.get('normalize_kl_per_var', False)
@@ -41,116 +44,20 @@ class DNRI_DynamicVars(nn.Module):
         self.steps = 0
         self.gpu = params.get('gpu')
 
-    def get_graph_info(self, masks):
-        num_vars = masks.size(-1)
-        edges = torch.ones(num_vars, device=masks.device) - torch.eye(num_vars, device=masks.device)
-        tmp = torch.where(edges)
-        send_edges = tmp[0]
-        recv_edges = tmp[1]
-        tmp_inds = torch.tensor(list(range(num_vars)), device=masks.device, dtype=torch.long).unsqueeze_(1) #TODO: should initialize as long
-        edge2node_inds = (tmp_inds == recv_edges.unsqueeze(0)).nonzero()[:, 1].contiguous().view(-1, num_vars-1)
-        edge_masks = masks[:, :, send_edges]*masks[:, :, recv_edges] #TODO: gotta figure this one out still
-        return send_edges, recv_edges, edge2node_inds, edge_masks
 
-    def single_step_forward(self, inputs, node_masks, graph_info, decoder_hidden, edge_logits, hard_sample):
+    def single_step_forward(self, inputs, node_masks, graph_info, decoder_hidden, edge_logits, hard_sample, edge_attr=None):
         old_shape = edge_logits.shape
         edges = model_utils.gumbel_softmax(
             edge_logits.reshape(-1, self.num_edge_types), 
             tau=self.gumbel_temp, 
             hard=hard_sample).view(old_shape)
-        predictions, decoder_hidden = self.decoder(inputs, decoder_hidden, edges, node_masks, graph_info)
+        predictions, decoder_hidden = self.decoder(inputs, decoder_hidden, edges, node_masks, graph_info, edge_attr)
         return predictions, decoder_hidden, edges
 
 
     def normalize_inputs(self, inputs, node_masks):
         return self.encoder.normalize_inputs(inputs, node_masks)
 
-    #@profile
-    def calculate_loss(self, inputs, node_masks, node_inds, graph_info, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False, normalized_inputs=None):
-        decoder_hidden = self.decoder.get_initial_hidden(inputs)
-        num_time_steps = inputs.size(1)
-        all_edges = []
-        all_predictions = []
-        all_priors = []
-        hard_sample = (not is_train) or self.train_hard_sample
-        prior_logits, posterior_logits, _ = self.encoder(inputs[:, :-1], node_masks[:, :-1], node_inds, graph_info, normalized_inputs)
-        if self.anneal_teacher_forcing:
-            teacher_forcing_steps = math.ceil((1 - self.train_percent)*num_time_steps)
-        else:
-            teacher_forcing_steps = self.teacher_forcing_steps
-        edge_ind = 0
-        for step in range(num_time_steps-1):
-            if (teacher_forcing and (teacher_forcing_steps == -1 or step < teacher_forcing_steps)) or step == 0:
-                current_inputs = inputs[:, step]
-            else:
-                current_inputs = predictions
-            current_node_masks = node_masks[:, step]
-            node_inds = current_node_masks.nonzero()[:, -1]
-            num_edges = len(node_inds)*(len(node_inds)-1)
-            current_graph_info = graph_info[0][step]
-            if not use_prior_logits:
-                current_p_logits = posterior_logits[:, edge_ind:edge_ind+num_edges]
-            else:
-                current_p_logits = prior_logits[:, edge_ind:edge_ind+num_edges]
-            if self.gpu:
-                current_p_logits = current_p_logits.cuda(non_blocking=True)
-            edge_ind += num_edges
-            predictions, decoder_hidden, edges = self.single_step_forward(current_inputs, current_node_masks, current_graph_info, decoder_hidden, current_p_logits, hard_sample)
-            all_predictions.append(predictions)
-            all_edges.append(edges)
-        all_predictions = torch.stack(all_predictions, dim=1)
-        target = inputs[:, 1:, :, :]
-        target_masks = ((node_masks[:, :-1] == 1)*(node_masks[:, 1:] == 1)).float()
-        loss_nll = self.nll(all_predictions, target, target_masks)
-        prob = F.softmax(posterior_logits, dim=-1)
-        if self.gpu:
-            prob = prob.cuda(non_blocking=True)
-            prior_logits = prior_logits.cuda(non_blocking=True)
-        loss_kl = self.kl_categorical_learned(prob, prior_logits)
-        loss = loss_nll + self.kl_coef*loss_kl
-        loss = loss.mean()
-        if return_edges:
-            return loss, loss_nll, loss_kl, edges
-        elif return_logits:
-            return loss, loss_nll, loss_kl, posterior_logits, all_predictions
-        else:
-            return loss, loss_nll, loss_kl
-
-    def get_prior_posterior(self, inputs, student_force=False, burn_in_steps=None):
-        self.eval()
-        posterior_logits = self.encoder(inputs)
-        posterior_probs = torch.softmax(posterior_logits, dim=-1)
-        prior_hidden = self.prior_model.get_initial_hidden(inputs)
-        all_logits = []
-        if student_force:
-            decoder_hidden = self.decoder.get_initial_hidden(inputs)
-            for step in range(burn_in_steps):
-                current_inputs= inputs[:, step]
-                predictions, prior_hidden, decoder_hidden, _, prior_logits = self.single_step_forward(current_inputs, prior_hidden, decoder_hidden, None, True)
-                all_logits.append(prior_logits)
-            for step in range(inputs.size(1) - burn_in_steps):
-                predictions, prior_hidden, decoder_hidden, _, prior_logits = self.single_step_forward(predictions, prior_hidden, decoder_hidden, None, True)
-                all_logits.append(prior_logits)
-        else:
-            for step in range(inputs.size(1)):
-                current_inputs = inputs[:, step]
-                prior_logits, prior_hidden = self.prior_model(prior_hidden, current_inputs)
-                all_logits.append(prior_logits)
-        logits = torch.stack(all_logits, dim=1)
-        prior_probs = torch.softmax(logits, dim=-1)
-        return prior_probs, posterior_probs
-
-    def get_edge_probs(self, inputs):
-        self.eval()
-        prior_hidden = self.prior_model.get_initial_hidden(inputs)
-        all_logits = []
-        for step in range(inputs.size(1)):
-            current_inputs = inputs[:, step]
-            prior_logits, prior_hidden = self.prior_model(prior_hidden, current_inputs)
-            all_logits.append(prior_logits)
-        logits = torch.stack(all_logits, dim=1)
-        edge_probs = torch.softmax(logits, dim=-1)
-        return edge_probs
 
     def predict_future(self, inputs, masks, node_inds, graph_info, burn_in_masks):
         '''
@@ -171,75 +78,84 @@ class DNRI_DynamicVars(nn.Module):
             current_inps = inputs[:, step]
             current_node_inds = node_inds[0][step] #TODO: check what's passed in here
             current_graph_info = graph_info[0][step]
+
             encoder_inp = current_burn_in_masks*current_inps + (1-current_burn_in_masks)*predictions
-            current_edge_logits, prior_hidden = self.encoder.single_step_forward(encoder_inp, current_masks, current_node_inds, current_graph_info, prior_hidden)
-            predictions, decoder_hidden, _ = self.single_step_forward(encoder_inp, current_masks, current_graph_info, decoder_hidden, current_edge_logits, True)
+            
+            current_edge_logits, prior_hidden, current_edge_attr = self.encoder.single_step_forward(encoder_inp, current_masks, current_node_inds, current_graph_info, prior_hidden)
+            predictions, decoder_hidden, _ = self.single_step_forward(encoder_inp, current_masks,
+                                                                      current_graph_info, decoder_hidden,
+                                                                      current_edge_logits, hard_sample=True,
+                                                                      edge_attr=current_edge_attr)
+            
             preds.append(predictions)
         return torch.stack(preds, dim=1)
 
-    def copy_states(self, prior_state, decoder_state):
-        if isinstance(prior_state, tuple) or isinstance(prior_state, list):
-            current_prior_state = (prior_state[0].clone(), prior_state[1].clone())
-        else:
-            current_prior_state = prior_state.clone()
-        if isinstance(decoder_state, tuple) or isinstance(decoder_state, list):
-            current_decoder_state = (decoder_state[0].clone(), decoder_state[1].clone())
-        else:
-            current_decoder_state = decoder_state.clone()
-        return current_prior_state, current_decoder_state
 
-    def merge_hidden(self, hidden):
-        if isinstance(hidden[0], tuple) or isinstance(hidden[0], list):
-            result0 = torch.cat([x[0] for x in hidden], dim=0)
-            result1 = torch.cat([x[1] for x in hidden], dim=0)
-            return (result0, result1)
-        else:
-            return torch.cat(hidden, dim=0)
-
-    def predict_future_fixedwindow(self, inputs, burn_in_steps, prediction_steps, batch_size):
-        if self.fix_encoder_alignment:
-            prior_logits, _, prior_hidden = self.encoder(inputs)
-        else:
-            prior_logits, _, prior_hidden = self.encoder(inputs[:, :-1])
+    def calculate_loss(self, inputs, node_masks, node_inds, graph_info, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False, normalized_inputs=None):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
-        for step in range(burn_in_steps-1):
-            current_inputs = inputs[:, step]
-            current_edge_logits = prior_logits[:, step]
-            predictions, decoder_hidden, _ = self.single_step_forward(current_inputs, decoder_hidden, current_edge_logits, True)
-        all_timestep_preds = []
-        for window_ind in range(burn_in_steps - 1, inputs.size(1)-1, batch_size):
-            current_batch_preds = []
-            prior_states = []
-            decoder_states = []
-            for step in range(batch_size):
-                if window_ind + step >= inputs.size(1):
-                    break
-                predictions = inputs[:, window_ind + step] 
-                current_edge_logits, prior_hidden = self.encoder.single_step_forward(predictions, prior_hidden)
-                predictions, decoder_hidden, _ = self.single_step_forward(predictions, decoder_hidden, current_edge_logits, True)
-                current_batch_preds.append(predictions)
-                tmp_prior, tmp_decoder = self.copy_states(prior_hidden, decoder_hidden)
-                prior_states.append(tmp_prior)
-                decoder_states.append(tmp_decoder)
-            batch_prior_hidden = self.merge_hidden(prior_states)
-            batch_decoder_hidden = self.merge_hidden(decoder_states)
-            current_batch_preds = torch.cat(current_batch_preds, 0)
-            current_timestep_preds = [current_batch_preds]
-            for step in range(prediction_steps - 1):
-                current_batch_edge_logits, batch_prior_hidden = self.encoder.single_step_forward(current_batch_preds, batch_prior_hidden)
-                current_batch_preds, batch_decoder_hidden, _ = self.single_step_forward(current_batch_preds, batch_decoder_hidden, current_batch_edge_logits, True)
-                current_timestep_preds.append(current_batch_preds)
-            all_timestep_preds.append(torch.stack(current_timestep_preds, dim=1))
-        result =  torch.cat(all_timestep_preds, dim=0)
-        return result.unsqueeze(0)
+        num_time_steps = inputs.size(1)
+        all_edges = []
+        all_predictions = []
+        all_priors = []
+        hard_sample = (not is_train) or self.train_hard_sample
+        prior_logits, posterior_logits, _, edge_attr = self.encoder(inputs[:, :-1], node_masks[:, :-1], node_inds, graph_info, normalized_inputs)
+        
+        teacher_forcing_steps = self.teacher_forcing_steps
+        edge_ind = 0
+
+        # print("total-steps:", num_time_steps, "teacher_forcing:", teacher_forcing, "teacher_forcing_steps:", teacher_forcing_steps)
+        for step in range(num_time_steps-1):
+            if (teacher_forcing and (teacher_forcing_steps == -1 or step < teacher_forcing_steps)) or step == 0:
+                current_inputs = inputs[:, step]
+            else:
+                current_inputs = predictions
+            current_node_masks = node_masks[:, step]
+            node_inds = current_node_masks.nonzero()[:, -1]
+            num_edges = len(node_inds)*(len(node_inds)-1)
+            current_graph_info = graph_info[0][step]
+            current_edge_attr = edge_attr[:, edge_ind:edge_ind+num_edges]
+            if not use_prior_logits:
+                current_p_logits = posterior_logits[:, edge_ind:edge_ind+num_edges]
+            else:
+                current_p_logits = prior_logits[:, edge_ind:edge_ind+num_edges]
+            if self.gpu:
+                current_p_logits = current_p_logits.cuda(non_blocking=True)
+            edge_ind += num_edges
+            predictions, decoder_hidden, edges = self.single_step_forward(current_inputs,
+                                                                          current_node_masks,
+                                                                          current_graph_info,
+                                                                          decoder_hidden,
+                                                                          current_p_logits,
+                                                                          hard_sample,
+                                                                          edge_attr=current_edge_attr)
+            all_predictions.append(predictions)
+            all_edges.append(edges)
+        
+        all_predictions = torch.stack(all_predictions, dim=1)
+        target = inputs[:, 1:, :, :]
+        target_masks = ((node_masks[:, :-1] == 1)*(node_masks[:, 1:] == 1)).float()
+        loss_nll = self.nll(all_predictions, target, target_masks)
+        prob = F.softmax(posterior_logits, dim=-1)
+        if self.gpu:
+            prob = prob.cuda(non_blocking=True)
+            prior_logits = prior_logits.cuda(non_blocking=True)
+        loss_kl = self.kl_categorical_learned(prob, prior_logits)
+        loss = loss_nll + self.kl_coef*loss_kl
+        loss = loss.mean()
+        if return_edges:
+            return loss, loss_nll, loss_kl, edges
+        elif return_logits:
+            return loss, loss_nll, loss_kl, posterior_logits, all_predictions
+        else:
+            return loss, loss_nll, loss_kl
+        
 
     def nll(self, preds, target, masks):
         if self.nll_loss_type == 'crossent':
             return self.nll_crossent(preds, target, masks)
         elif self.nll_loss_type == 'gaussian':
             return self.nll_gaussian(preds, target, masks)
-        elif self.nll_loss_type == 'poisson':
-            return self.nll_poisson(preds, target, masks)
+
 
     def nll_gaussian(self, preds, target, masks, add_const=False):
         neg_log_p = ((preds - target) ** 2 / (2 * self.prior_variance))*masks.unsqueeze(-1)
@@ -260,12 +176,6 @@ class DNRI_DynamicVars(nn.Module):
         else:
             raise NotImplementedError()
 
-    def nll_poisson(self, preds, target, masks):
-        if self.normalize_nll:
-            loss = nn.PoissonNLLLoss(reduction='none')(preds, target)
-            return (loss*masks.unsqueeze(-1)).view(preds.size(0), -1).sum(dim=-1)/(masks.view(masks.size(0), -1).sum(dim=1))
-        else:
-            raise NotImplementedError()
 
     def kl_categorical_learned(self, preds, prior_logits):
         log_prior = nn.LogSoftmax(dim=-1)(prior_logits)
@@ -277,10 +187,14 @@ class DNRI_DynamicVars(nn.Module):
         else:
             raise NotImplementedError()
 
-    def save(self, path):
+
+    def save(self, save_folder):
+        path = os.path.join(save_folder, 'model.pt')
         torch.save(self.state_dict(), path)
 
-    def load(self, path):
+
+    def load(self, load_folder):
+        path = os.path.join(load_folder, 'model.pt')
         self.load_state_dict(torch.load(path))
 
 
@@ -345,6 +259,15 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             self.bn = nn.BatchNorm1d(inp_size)
         # Possible options: None, 'normalize_inp', 'normalize_all'
 
+        if True: #params.edge_features:
+            tmp_hidden_size = params['prior_hidden_size']
+            layers = [nn.Linear(rnn_hidden_size, tmp_hidden_size), nn.ELU(inplace=True)]
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(tmp_hidden_size, tmp_hidden_size))
+                layers.append(nn.ELU(inplace=True))
+            layers.append(nn.Linear(tmp_hidden_size, EDGE_FEAT_DIM))
+            self.features_fc_out = nn.Sequential(*layers)
+
         self.init_weights()
         
     def init_weights(self):
@@ -399,18 +322,17 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         count = 0
         for inputs, node_masks in zip(inp_list, node_masks_list):
             if not self.training:
-                #print("IND %d OF %d"%(count, len(node_masks_list)))
                 count += 1
             flat_masks = node_masks.nonzero(as_tuple=True)
             batch_num_vars = (node_masks != 0).sum(dim=-1)
             num_vars = batch_num_vars.view(-1)
+
             #TODO: is it faster to put this on cpu or gpu?
             edge_info = [torch.where(torch.ones(nvar, device=num_vars.device) - torch.eye(nvar, device=num_vars.device)) for nvar in num_vars]
             offsets = torch.cat([torch.tensor([0], dtype=torch.long, device=num_vars.device), num_vars.cumsum(0)[:-1]])
             send_edges = torch.cat([l[0] + offset for l, offset in zip(edge_info, offsets)])
             recv_edges = torch.cat([l[1] + offset for l, offset in zip(edge_info, offsets)])
             
-            pdb.set_trace()
             flat_inp = inputs[flat_masks]
             tmp_batch = flat_inp.size(0)
             x = self.mlp1(flat_inp)
@@ -435,7 +357,6 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         return final_result
 
     def forward(self, inputs, node_masks, all_node_inds, all_graph_info, normalized_inputs=None):
-        pdb.set_trace()
         if inputs.size(0) > 1:
             raise ValueError("Batching during forward not currently supported")
         if self.normalize_mode == 'normalize_all':
@@ -447,7 +368,6 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             # Right now, we'll always want to do this
             raise NotImplementedError
         
-        pdb.set_trace()
         # Inputs is shape [batch, num_timesteps, num_vars, input_size]
         num_timesteps = node_masks.size(1)
         max_num_vars = inputs.size(2)
@@ -526,9 +446,11 @@ class DNRI_DynamicVars_Encoder(nn.Module):
         all_forward_states = torch.cat(all_forward_states, dim=1)
         all_reverse_states = torch.cat(all_reverse_states, dim=1).flip(1)
         all_states = torch.cat([all_forward_states, all_reverse_states], dim=-1)
+        
         prior_result = self.prior_fc_out(all_forward_states)
+        edge_features = self.features_fc_out(all_forward_states)
         encoder_result = self.encoder_fc_out(all_states)
-        return prior_result, encoder_result, forward_state
+        return prior_result, encoder_result, forward_state, edge_features
         
     def single_step_forward(self, inputs, node_masks, node_inds, all_graph_info, forward_state):
         if self.normalize_mode == 'normalize_all':
@@ -553,10 +475,11 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             tmp_state1[:, global_edge_inds] = current_state[1]
             forward_state = (tmp_state0, tmp_state1)
             prior_result = self.prior_fc_out(current_state[0])
+            edge_features = self.features_fc_out(current_state[0])
         else:
             prior_result = torch.empty(1, 0, self.num_edges)
 
-        return prior_result, forward_state
+        return prior_result, forward_state, edge_features
 
 
 class DNRI_DynamicVars_Decoder(nn.Module):
@@ -569,9 +492,10 @@ class DNRI_DynamicVars_Decoder(nn.Module):
         skip_first = params['skip_first']
         out_size = params['input_size']
         do_prob = params['decoder_dropout']
+        edge_feature_dim = EDGE_FEAT_DIM
 
         self.msg_fc1 = nn.ModuleList(
-            [nn.Linear(2*n_hid, n_hid) for _ in range(edge_types)]
+            [nn.Linear(2*n_hid + edge_feature_dim, n_hid) for _ in range(edge_types)]
         )
         self.msg_fc2 = nn.ModuleList(
             [nn.Linear(n_hid, n_hid) for _ in range(edge_types)]
@@ -604,7 +528,7 @@ class DNRI_DynamicVars_Decoder(nn.Module):
                 nn.init.xavier_normal_(m.weight.data)
                 m.bias.data.fill_(0.1)
 
-    def forward(self, inputs, hidden, edges, node_masks, graph_info):
+    def forward(self, inputs, hidden, edges, node_masks, graph_info, edge_attr=None):
         # Input Size: [batch, num_vars, input_size]
         # Hidden Size: [batch, num_vars, rnn_hidden]
         # Edges size: [batch, current_num_edges, num_edge_types]
@@ -626,6 +550,12 @@ class DNRI_DynamicVars_Decoder(nn.Module):
             senders = current_hidden[:, send_edges]
             # pre_msg: [batch, num_edges, 2*msg_out]
             pre_msg = torch.cat([receivers, senders], dim=-1)
+            if edge_attr is not None:
+                try:
+                    pre_msg = torch.cat([pre_msg, edge_attr], dim=-1)
+                except:
+                    pdb.set_trace()
+
 
             all_msgs = torch.zeros(pre_msg.size(0), pre_msg.size(1),
                                             self.msg_out_shape, device=inputs.device)
